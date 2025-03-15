@@ -1,0 +1,6 @@
+.history
+.ref
+.env
+data/
+logs/
+__pycache__

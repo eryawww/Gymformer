@@ -1,0 +1,11 @@
+tes: 123
+
+# defaults:  
+#   - _self_  
+#   - override hydra/hydra_logging: disabled  # turn off logs
+#   - override hydra/job_logging: disabled  # turn off logs
+  
+hydra:  
+  # output_subdir: null   # turn off logs
+  run:  
+    dir: logs
