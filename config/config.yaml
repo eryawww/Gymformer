@@ -1,5 +1,16 @@
 tes: 123
 
+run:
+  dry_run: True
+  train_reward: True
+  train_lm: False
+
+reward:
+  model: openai-community/gpt2
+  datasets_path: 
+    - data/descriptiveness_offline_5k.json
+  batch_size: 32
+
 # defaults:  
 #   - _self_  
 #   - override hydra/hydra_logging: disabled  # turn off logs

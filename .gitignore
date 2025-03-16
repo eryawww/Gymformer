@@ -1,6 +1,6 @@
 .history
 .ref
 .env
-data/
 logs/
+data/
 __pycache__

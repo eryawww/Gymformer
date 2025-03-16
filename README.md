@@ -1,3 +1,8 @@
+# Installation
+
+1. Run `scripts/download_openai_data.sh` to download original openai data.
+2. Run `poetry run python launch.py` to run the script
+
 # Tech Stack
 
 1. Experiment Tracking
@@ -64,11 +69,12 @@ $$
 $$
 
 # Components
-1. WnB & Hydra integration
+1. WnB & Hydra (Logging and config management) integration
 2. Commitizen
 3. 
 
 # TODO
-1. Implemeng hydra for hyperparameter space
-2. Understand WnB and track metrics
-3. Logging using WnB or logging package
+1. Implement reward model
+2. Implemeng hydra for hyperparameter space
+3. Understand WnB and track metrics
+4. Implement Hydra run and hydra sweep
