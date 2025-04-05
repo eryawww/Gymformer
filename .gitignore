@@ -4,3 +4,5 @@
 logs/
 data/
 __pycache__
+ref/
+wandb/
