@@ -1,10 +1,12 @@
+from typing import override
 import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
 import logging
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
 
 class RewardModel(nn.Module):
     def __init__(self, base_model: str, dropout: float = 0.1):
@@ -13,16 +15,27 @@ class RewardModel(nn.Module):
         self.base_model = base_model
         self.tokenizer = AutoTokenizer.from_pretrained(base_model)
         self.model = AutoModelForCausalLM.from_pretrained(base_model)
-        
+
         hidden_size = self.model.config.hidden_size
         self.dropout = nn.Dropout(dropout)
-        self.linear = nn.Linear(hidden_size, 1)
+        self.score = nn.Linear(hidden_size, 1)
         
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model.config.pad_token_id = self.tokenizer.eos_token_id
 
+        # Accelerator support used in PPOTrainer
+        # self.base_model_prefix = self.model.base_model_prefix
     
-    def forward(self, query: torch.Tensor, samples: torch.Tensor, best: torch.Tensor) -> torch.Tensor:
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if hasattr(self.model, name): # Inherit everything from main
+                return getattr(self.model, name)
+            raise AttributeError(f"Attribute {name} not found in RewardModel or its submodules.")
+
+    
+    def forward(self, query: dict[str, torch.Tensor], sample0: dict[str, torch.Tensor], sample1: dict[str, torch.Tensor], sample2: dict[str, torch.Tensor], sample3: dict[str, torch.Tensor], best: torch.Tensor) -> torch.Tensor:
         """
             This function computes the loss for one batch of data.
             
@@ -33,23 +46,32 @@ class RewardModel(nn.Module):
                 loss = log frac{ exp(r(x, y_best)) }{ sum_i exp(r(x, y_i)) }
         
             Args:
-                query: torch.tensor, shape (batch_size, seq_len)
-                samples: torch.tensor, shape (batch_size, 4, seq_len)
+                query: dict[str, torch.Tensor] with keys 'input_ids' and 'attention_mask', shape (batch_size, seq_len)
+                sample0: dict[str, torch.Tensor] with keys 'input_ids' and 'attention_mask', shape (batch_size, seq_len)
+                sample1: dict[str, torch.Tensor] with keys 'input_ids' and 'attention_mask', shape (batch_size, seq_len)
+                sample2: dict[str, torch.Tensor] with keys 'input_ids' and 'attention_mask', shape (batch_size, seq_len)
+                sample3: dict[str, torch.Tensor] with keys 'input_ids' and 'attention_mask', shape (batch_size, seq_len)
                 best: int, shape (batch_size)
             Returns:
                 loss: torch.tensor, shape (1)
         """
-        log.debug(f'Forward with Query: {query.shape} Samples: {samples.shape} Best: {best.shape}')
-        assert query.size(0) == samples.size(0) == best.size(0), 'Batch size must be same for all inputs {}, {}, {}'.format(query.size(0), samples.size(0), best.size(0))
-        batch_size, sample_size = query.size(0), samples.size(1)
+        log.debug(f'Forward with Query: {query["input_ids"].shape} Samples: {[sample0["input_ids"].shape, sample1["input_ids"].shape, sample2["input_ids"].shape, sample3["input_ids"].shape]} Best: {best.shape}')
+        assert query["input_ids"].size(0) == sample0["input_ids"].size(0) == sample1["input_ids"].size(0) == sample2["input_ids"].size(0) == sample3["input_ids"].size(0) == best.size(0), 'Batch size must be same for all inputs'
+        batch_size = query["input_ids"].size(0)
 
         combined_query_samples_list = []
+        combined_attention_samples_list = []
         for i_batch in range(batch_size):
-            for j_sample in range(sample_size):
-                combined = self._combine_query_sample(query[i_batch], samples[i_batch, j_sample, :])
+            for sample in [sample0, sample1, sample2, sample3]:
+                # print(query["input_ids"].shape, sample["input_ids"].shape)
+                combined = self._combine_query_sample(query["input_ids"][i_batch], sample["input_ids"][i_batch])
                 combined_query_samples_list.append(combined)
-        combined_query_samples = pad_sequence(combined_query_samples_list, batch_first=True, padding_value=self.tokenizer.pad_token_id) 
-        combined_attention_samples = (combined_query_samples != self.tokenizer.pad_token_id).long()
+                
+                combined_attention = self._combine_query_sample(query["attention_mask"][i_batch], sample["attention_mask"][i_batch])
+                combined_attention_samples_list.append(combined_attention)
+
+        combined_query_samples = torch.stack(combined_query_samples_list, dim=0) 
+        combined_attention_samples = torch.stack(combined_attention_samples_list, dim=0)
         log.debug(f'Combined Query Padded Sequence: {combined_query_samples.shape}') # (batch_size * sample_size, seq_len)
         log.debug(f'Combined Attention Samples: {combined_attention_samples.shape}') # (batch_size * sample_size, seq_len)
 
@@ -61,9 +83,9 @@ class RewardModel(nn.Module):
         
         log.debug(f'Hidden States: {hidden_states.shape}') # (batch_size * sample_size, hidden_size)
         hidden_states = self.dropout(hidden_states)
-        output = self.linear(hidden_states) # (batch_size * sample_size, 1)
+        output = self.score(hidden_states) # (batch_size * sample_size, 1)
         log.debug(f'Output Flatten: {output.shape}')
-        output = output.view(batch_size, sample_size) # (batch_size, sample_size)
+        output = output.view(batch_size, 4) # (batch_size, 4)
         log.debug(f'Output: {output.shape}')
         
         best = best.unsqueeze(1) # (batch_size, 1)
@@ -100,4 +122,22 @@ class RewardModel(nn.Module):
         combined_query_sample[new_query.size(0):new_query.size(0)+sample.size(0)] = sample
         return combined_query_sample
     
-    
+    @classmethod
+    def load(cls, base_model: str, load_path: str) -> 'RewardModel':
+        """
+        Load a saved reward model from a checkpoint.
+        
+        Args:
+            load_path (str): Path to the checkpoint file.
+        
+        Returns:
+            RewardModel: The loaded reward model.
+        """
+        # from transformers.models.gpt2.configuration_gpt2 import GPT2Config
+        # torch.serialization.safe_globals([GPT2Config])
+        
+        train_reward_checkpoint = torch.load(load_path, weights_only=False)
+        reward_model = train_reward_checkpoint['model_state_dict']
+        model = cls(base_model)
+        model.load_state_dict(reward_model)
+        return model

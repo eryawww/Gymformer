@@ -1,1 +1,1 @@
-from . import train_reward, reward_model, utils
+from . import train_reward, reward_model, utils, train_lm

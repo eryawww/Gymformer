@@ -1,20 +1,20 @@
 reward:
   model: openai-community/gpt2
   datasets_path:
-    - data/descriptiveness_offline_5k.json
+    - data/descriptiveness_offline_5k
   batch_size: 32
   epochs: 3
 
 lm:
   model: openai-community/gpt2
   datasets_path:
-    - data/descriptiveness_offline_5k.json
-  batch_size: 16
+    - data/descriptiveness_offline_5k
+  batch_size: 2
   epochs: 5
+  # TODO: Do proper configuration
   ppo:
     learning_rate: 1.4e-5
     max_grad_norm: 0.5
-    target_kl: 0.1
     init_kl_coef: 0.2
     response_length_min: 32
     response_length_max: 96

@@ -1,7 +1,8 @@
 # Installation
 
 1. Run `scripts/download_openai_data.sh` to download original openai data.
-2. Run `poetry run python launch.py` to run the script
+2. Decode openai tensor format into text first to generalize the code
+3. Run `poetry run python launch.py` to run the script
 
 # Tech Stack
 

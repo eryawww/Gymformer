@@ -5,19 +5,6 @@ import os
 
 PROJECT_PATH = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
 
-def test_openai_dataset():
-    DATA_FILENAME = [
-        'cnndm_offline_60k.json',
-        'cnndm_online_45k.json',
-        'descriptiveness_offline_5k.json',
-        'sentimen_offline_5k.json',
-        'tldr_offline_60k.json',
-        'tldr_online_45k.json'
-    ]
-    for filename in DATA_FILENAME:
-        reward_data = RewardData.from_openai(f'{PROJECT_PATH}/data/{filename}', -1)
-        reward_data.to_dataset()
-
 def test_combine_query_sample():
     # Mock RewardModel object
     class DummyTokenizer:

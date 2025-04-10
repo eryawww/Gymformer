@@ -5,7 +5,8 @@ import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from datasets import Dataset, concatenate_datasets
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorWithPadding
 import pandas as pd
 import swifter
 from tqdm import tqdm
@@ -15,29 +16,102 @@ from .reward_model import RewardModel
 
 log = logging.getLogger(__name__)
 
-@dataclass
-class RewardData:
-    query: list[str]
-    sample0: list[str]
-    sample1: list[str]
-    sample2: list[str]
-    sample3: list[str]
-    best: int
+class RewardData(torch.utils.data.Dataset):
+    text_columns = ['query', 'sample0', 'sample1', 'sample2', 'sample3']
+
+    def __init__(self, tokenizer, query: list[str], sample0: list[str], sample1: list[str], sample2: list[str], sample3: list[str], best: list[int]):
+        self.tokenizer = tokenizer
+
+        # HACK: CURRENTLY ONLY WORK FOR GPT2
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.query: list[str] = query
+        self.sample0: list[str] = sample0
+        self.sample1: list[str] = sample1
+        self.sample2: list[str] = sample2
+        self.sample3: list[str] = sample3
+        self.best: list[int] = best
+
+        self.collate_fn = lambda batch: RewardData.collate_fn(self.tokenizer.pad_token_id, batch)
+    
+    def __getitem__(self, idx) -> dict[str, torch.Tensor]:
+        single_data_tensor = {
+            'query': self.query[idx],
+            'sample0': self.sample0[idx],
+            'sample1': self.sample1[idx],
+            'sample2': self.sample2[idx],
+            'sample3': self.sample3[idx],
+            'best': torch.tensor(self.best[idx])
+        }
+        for key in self.text_columns:
+            value = single_data_tensor[key]
+            single_data_tensor[key] = self.tokenizer(value, return_tensors='pt')
+    
+        return single_data_tensor
+    
+    def __len__(self):
+        return len(self.query)
+    
+    @staticmethod
+    def from_dataset(tokenizer, dataset: Dataset) -> 'RewardData':
+        return RewardData(tokenizer, **{col: dataset[col] for col in dataset.column_names})
 
     @staticmethod
-    def from_openai(json_path: str, pad_token: int):        
-        json_df = pd.read_json(json_path)
-        # HACK: tokens 50259 is used as padding token, unknown for GPT2, replace with configured pad_token
-        for col in ['query', 'sample0', 'sample1', 'sample2', 'sample3']:
-            json_df[col] = json_df[col].swifter.apply(lambda lst: [pad_token if x == 50259 else x for x in lst])
+    def from_openai_format(tokenizer, path: str) -> 'RewardData':
+        dataset = Dataset.load_from_disk(path)
+        return RewardData(tokenizer, **{col: dataset[col] for col in dataset.column_names})
+    
+    @staticmethod
+    def collate_fn(pad_token_id, batch):
+        keys_to_pad = ['query', 'sample0', 'sample1', 'sample2', 'sample3']
+        num_batch = len(batch)
         
-        return RewardData(**{
-            col: json_df[col] for col in json_df.columns
-        })
+        # Determine the maximum sequence length
+        max_length = 0
+        for key in keys_to_pad:
+            max_length = max(
+                max_length, 
+                max(len(batch[idx][key]['input_ids'][0]) for idx in range(num_batch))
+            )
+        
+        # Pad each key to the maximum sequence length
+        padded_batch = {
+            'best': torch.tensor([batch[idx]['best'] for idx in range(num_batch)])
+        }
+        for key in keys_to_pad:
+            key_input_ids_padded = []
+            key_attention_mask_padded = []
+            for idx in range(num_batch):
+                input_ids = batch[idx][key]['input_ids'][0] # (seqlen)
+                attention_mask = batch[idx][key]['attention_mask'][0] # (seqlen)
+
+                needed_pad = max_length - len(input_ids)
+                
+                ids_pad_tensor = torch.full((needed_pad, ), pad_token_id)
+                att_pad_tensor = torch.full((needed_pad, ), 0)
+
+                input_ids_padded = torch.concat([input_ids, ids_pad_tensor], dim=0) # (maxlen)
+                attention_mask_padded = torch.concat([attention_mask, att_pad_tensor], dim=0) # (maxlen)
+                key_input_ids_padded.append(input_ids_padded)
+                key_attention_mask_padded.append(attention_mask_padded)
+
+            padded_batch[key] = {
+                'input_ids': torch.stack(key_input_ids_padded, dim=0),
+                'attention_mask': torch.stack(key_attention_mask_padded, dim=0)
+            }
+        
+        # print(padded_batch['query']['input_ids'].shape, padded_batch['sample0']['input_ids'].shape, padded_batch['sample1']['input_ids'].shape, padded_batch['sample2']['input_ids'].shape, padded_batch['sample3']['input_ids'].shape, padded_batch['best'].shape)
+        return padded_batch
     
     def to_dataset(self) -> Dataset:
-        dataset = Dataset.from_dict(asdict(self))
-        return dataset
+        return Dataset.from_dict({
+            'query': self.query,
+            'sample0': self.sample0,
+            'sample1': self.sample1,
+            'sample2': self.sample2,
+            'sample3': self.sample3,
+            'best': self.best
+        })
     
 class RewardTrainer:
     def __init__(self, base_model: str, datasets_path: list[str], batch_size: int, dry_run: bool):
@@ -47,26 +121,24 @@ class RewardTrainer:
         """
         log.info('Instantiating RewardTrainer')
         self.base_model = base_model
-        self.model = RewardModel(base_model)
         self.dry_run = dry_run
         self.batch_size = batch_size
+
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model)
+        self.model = RewardModel(base_model)
         
         self.datasets_path = datasets_path
         
-        # TODO: Support for another model, .from_openai is a tokenizer output for GPT2
-        # by decoding the tokens to text using GPT2 tokenizer
-        assert 'openai-community/gpt2' in base_model, 'Only GPT2 model is supported for now' 
-
         log.debug(f'Is Dry run: {self.dry_run}')
         if self.dry_run:
             datasets: list[Dataset] = [
-                RewardData.from_openai(path, pad_token=self.model.tokenizer.pad_token_id).to_dataset().select(range(2*batch_size)) for path in datasets_path[:2]
+                RewardData.from_openai_format(self.tokenizer, path).to_dataset().select(range(64)) for path in datasets_path[:2]
             ]
         else:
             datasets: list[Dataset] = [
-                RewardData.from_openai(path, pad_token=self.model.tokenizer.pad_token_id).to_dataset() for path in datasets_path
+                RewardData.from_openai_format(self.tokenizer, path).to_dataset() for path in datasets_path
             ]
-        self.dataset = concatenate_datasets(datasets)
+        self.dataset = RewardData.from_dataset(self.tokenizer, concatenate_datasets(datasets))
 
     @staticmethod
     def train(base_model: str, datasets_path: list[str], batch_size: int, epochs: int, dry_run: bool) -> 'RewardTrainer':
@@ -89,16 +161,14 @@ class RewardTrainer:
         log.debug(f'Training dataset size : {len(dataset)}')
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
 
+        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=trainer.dataset.collate_fn)
+
         for epoch in tqdm(range(epochs)):
             log.debug(f'Running on epoch : {epoch}')
-            for batch in dataset.iter(batch_size):
-                batch_tensor = {
-                    key: torch.tensor(batch[key]) for key in batch.keys()
-                }
-                
-                query, best = batch_tensor['query'], batch_tensor['best']
-                samples = torch.stack([batch_tensor[f'sample{i}'] for i in range(4)], dim=1)
-                loss = model(query, samples, best)
+            for batch in dataloader:
+                query, best = batch['query'], batch['best']
+                sample0, sample1, sample2, sample3 = batch['sample0'], batch['sample1'], batch['sample2'], batch['sample3']
+                loss = model(query, sample0, sample1, sample2, sample3, best)
                 log.debug(f'Loss Value : {loss}')
                 log.debug(f'Doing Backward')
 
