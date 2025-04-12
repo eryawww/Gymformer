@@ -5,14 +5,26 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
 import logging
 
+from .utils import set_seed, get_device
+
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
 
 class RewardModel(nn.Module):
-    def __init__(self, base_model: str, dropout: float = 0.1):
+    def __init__(self, base_model: str, dropout: float = 0.1, seed: int = 42, device: str = 'cuda'):
         log.info('Instantiating RewardModel')
         super().__init__()
         self.base_model = base_model
+        self.seed = seed
+        self.device_str = device
+        
+        # Set seed for reproducibility
+        set_seed(self.seed)
+        
+        # Set device
+        self.device = get_device(self.device_str)
+        log.info(f'Using device: {self.device}')
+        
         self.tokenizer = AutoTokenizer.from_pretrained(base_model)
         self.model = AutoModelForCausalLM.from_pretrained(base_model)
 
@@ -22,6 +34,10 @@ class RewardModel(nn.Module):
         
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model.config.pad_token_id = self.tokenizer.eos_token_id
+
+        # Move model components to the specified device
+        self.model.to(self.device)
+        self.score.to(self.device)
 
         # Accelerator support used in PPOTrainer
         # self.base_model_prefix = self.model.base_model_prefix
@@ -75,6 +91,10 @@ class RewardModel(nn.Module):
         log.debug(f'Combined Query Padded Sequence: {combined_query_samples.shape}') # (batch_size * sample_size, seq_len)
         log.debug(f'Combined Attention Samples: {combined_attention_samples.shape}') # (batch_size * sample_size, seq_len)
 
+        # Move combined tensors to device
+        combined_query_samples = combined_query_samples.to(self.device)
+        combined_attention_samples = combined_attention_samples.to(self.device)
+
         log.debug(f'Running Forward on Model')
         self.model.eval()
         with torch.no_grad():
@@ -111,7 +131,8 @@ class RewardModel(nn.Module):
             Output format is [Q1, Q2, ..., S1, S2, ..., PAD, PAD]
         """
         assert query.dim() == 1 and sample.dim() == 1, 'Query and Sample must be 1D tensor'
-        # TODO: On bad datasets, there exists case where continuation is on subword level
+        # BUG: On some datasets, there exists case where continuation is on subword level 
+        #   Query: "... work" Sample: "ing ...", "working" should be single token instead of two tokens concatenated
         # in this case, decode into string and then re-encode is the general solution
 
         combined_query_sample = torch.full((query.size(0) + sample.size(0),), self.tokenizer.pad_token_id)
@@ -123,21 +144,46 @@ class RewardModel(nn.Module):
         return combined_query_sample
     
     @classmethod
-    def load(cls, base_model: str, load_path: str) -> 'RewardModel':
+    def load(cls, base_model: str, load_path: str, seed: int = 42, device: str = 'cuda') -> 'RewardModel':
         """
         Load a saved reward model from a checkpoint.
         
         Args:
             load_path (str): Path to the checkpoint file.
+            seed (int): Random seed for reproducibility
+            device (str): Device to load the model on ('cuda', 'cpu', or 'mps')
         
         Returns:
             RewardModel: The loaded reward model.
         """
-        # from transformers.models.gpt2.configuration_gpt2 import GPT2Config
-        # torch.serialization.safe_globals([GPT2Config])
+        from transformers.models.gpt2.configuration_gpt2 import GPT2Config
+        torch.serialization.safe_globals([GPT2Config]) # BUG: Dynamic workaround should be implemented
         
-        train_reward_checkpoint = torch.load(load_path, weights_only=False)
+        train_reward_checkpoint = torch.load(load_path, weights_only=False, map_location='cpu')
         reward_model = train_reward_checkpoint['model_state_dict']
-        model = cls(base_model)
+        # Get seed from checkpoint if available, otherwise use provided seed
+        saved_seed = train_reward_checkpoint.get('seed', seed)
+        # Get device from checkpoint if available, otherwise use provided device
+        saved_device = train_reward_checkpoint.get('device', device)
+        
+        model = cls(base_model, seed=saved_seed, device=saved_device)
         model.load_state_dict(reward_model)
+        
+        # Move model to the specified device
+        model.to(get_device(saved_device))
+        
         return model
+        
+    def to(self, device):
+        """
+        Move the model to the specified device.
+        
+        Args:
+            device: The device to move the model to
+            
+        Returns:
+            self: The model instance
+        """
+        self.model = self.model.to(device)
+        self.score = self.score.to(device)
+        return super().to(device)

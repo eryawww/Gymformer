@@ -23,8 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--inference', action='store_true', default=False, help='Run inference')
     # Run config
     parser.add_argument('--dry-run', action='store_true', help='Run in dry-run mode')
+    parser.add_argument('--device', type=str, default='cuda', choices=['cuda', 'cpu', 'mps'], help='Device to run on (cuda, cpu, or mps)')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     args = parser.parse_args()
     return args
+
 def main():
     args = parse_args()
 
@@ -57,7 +60,9 @@ def train_reward(args, config):
         datasets_path=config.reward['datasets_path'],
         batch_size=config.reward['batch_size'],
         epochs=config.reward['epochs'],
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        seed=args.seed,
+        device=args.device
     )
 
     trainer.save(args.reward_model)
@@ -73,7 +78,9 @@ def train_lm(args, config):
         reward_model_path=args.reward_model,
         output_dir=args.lm_model,
         dry_run=args.dry_run,
-        config=config.lm
+        config=config.lm,
+        seed=args.seed,
+        device=args.device
     )
 
     trainer.save(args.lm_model)

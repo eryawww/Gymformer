@@ -12,29 +12,42 @@ from trl.core import LengthSampler
 
 from .reward_model import RewardModel
 from .train_reward import RewardData
+from .utils import set_seed, get_device
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
 
 class LMTrainer:
-    def __init__(self, base_model: str, datasets_path: list[str], batch_size: int, epochs: int, reward_model_path: str, output_dir: str, dry_run: bool, config: dict):
+    def __init__(self, base_model: str, datasets_path: list[str], batch_size: int, epochs: int, reward_model_path: str, output_dir: str, dry_run: bool, config: dict, seed: int = 42, device: str = 'cuda'):
         self.base_model_name = base_model
         self.dry_run = dry_run
         self.datasets_path = datasets_path
         self.batch_size = batch_size
         self.epochs = epochs
+        self.seed = seed
+        self.device_str = device
+        
+        # Set seed for reproducibility
+        set_seed(self.seed)
+        
+        # Set device
+        self.device = get_device(self.device_str)
+        log.info(f'Using device: {self.device}')
         
         # Initialize models and tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(base_model)
         
         self.model = AutoModelForCausalLM.from_pretrained(
             base_model,
-        )
-        self.ref_model = create_reference_model(self.model)
+        ).to(self.device)
+        
+        self.ref_model = create_reference_model(self.model).to(self.device)
+        
         self.value_model = AutoModelForSequenceClassification.from_pretrained(
             base_model, num_labels=1
-        )
-        self.reward_model = RewardModel.load(base_model, reward_model_path)
+        ).to(self.device)
+        
+        self.reward_model = RewardModel.load(base_model, reward_model_path, device=self.device_str)
 
         training_data, test_datasets = self._prepare_dataset(datasets_path)
         
@@ -47,7 +60,8 @@ class LMTrainer:
             total_episodes=config['epochs'],
             cliprange=0.2,
             missing_eos_penalty=1.0,
-            kl_coef=0.2
+            kl_coef=0.2,
+            seed=self.seed,  # Set seed in PPO config
         )
         
         self.ppo_trainer = PPOTrainer(
@@ -66,7 +80,7 @@ class LMTrainer:
         """Prepare dataset for PPO training"""
         if self.dry_run:
             datasets_path = self.datasets_path[:1]
-            max_samples = 6 * self.batch_size
+            max_samples = 30 * self.batch_size
         else:
             datasets_path = self.datasets_path
             max_samples = None
@@ -85,20 +99,22 @@ class LMTrainer:
             
             dataset = dataset.map(prepare_ppo_data, remove_columns=dataset.column_names)
 
-            train_size = int(0.8 * len(dataset))
-            test_size = len(dataset) - train_size
-
-            splitted_dataset = dataset.train_test_split(train_size, test_size)
-            train_dataset, test_dataset = splitted_dataset['train'], splitted_dataset['test']
+            # Use a fixed seed for train-test split
+            train_test_split = dataset.train_test_split(
+                train_size=int(0.8 * len(dataset)),
+                test_size=int(0.2 * len(dataset)),
+                seed=self.seed
+            )
+            train_dataset, test_dataset = train_test_split['train'], train_test_split['test']
             datasets.append((train_dataset, test_dataset))
         
         train_datasets, test_datasets = zip(*datasets)
         return concatenate_datasets(train_datasets), concatenate_datasets(test_datasets)
     
     @staticmethod
-    def train(base_model: str, datasets_path: list[str], batch_size: int, epochs: int, reward_model_path: str, output_dir: str, dry_run: bool, config: dict) -> "LMTrainer":
+    def train(base_model: str, datasets_path: list[str], batch_size: int, epochs: int, reward_model_path: str, output_dir: str, dry_run: bool, config: dict, seed: int = 42, device: str = 'cuda') -> "LMTrainer":
         """Train language model using PPO with reward model feedback"""
-        trainer = LMTrainer(base_model, datasets_path, batch_size, epochs, reward_model_path, output_dir, dry_run, config)
+        trainer = LMTrainer(base_model, datasets_path, batch_size, epochs, reward_model_path, output_dir, dry_run, config, seed, device)
         
         log.info("Starting PPO training loop...")
         trainer.ppo_trainer.train()
@@ -106,8 +122,49 @@ class LMTrainer:
         return trainer
     
     def save(self, save_path: str):
+        # Move models to CPU before saving to ensure compatibility
+        self.model.to('cpu')
+        self.ref_model.to('cpu')
+        self.value_model.to('cpu')
+        self.reward_model.to('cpu')
+        
         self.ppo_trainer.save_model(save_path)
+        
+        # Save additional information for reproducibility
+        torch.save({
+            'seed': self.seed,
+            'config': self.ppo_config,
+            'device': self.device_str
+        }, f"{save_path}/training_metadata.pt")
+        
+        # Move models back to original device
+        self.model.to(self.device)
+        self.ref_model.to(self.device)
+        self.value_model.to(self.device)
+        self.reward_model.to(self.device)
     
-    def load(self, save_path: str):
+    def load(self, save_path: str, device: str = None):
+        # Load models
         self.ppo_trainer.load_model(save_path)
         
+        # Load additional metadata if available
+        try:
+            metadata = torch.load(f"{save_path}/training_metadata.pt")
+            self.seed = metadata.get('seed', 42)
+            
+            # Update device if specified
+            if device is not None:
+                self.device_str = device
+                self.device = get_device(self.device_str)
+            else:
+                self.device_str = metadata.get('device', 'cuda')
+                self.device = get_device(self.device_str)
+                
+            # Move models to the specified device
+            self.model.to(self.device)
+            self.ref_model.to(self.device)
+            self.value_model.to(self.device)
+            self.reward_model.to(self.device)
+            
+        except:
+            log.warning(f"Could not load training metadata from {save_path}/training_metadata.pt")
