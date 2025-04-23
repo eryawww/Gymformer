@@ -190,9 +190,9 @@ class RewardTrainer:
             generator=g
         )
 
-        for epoch in tqdm(range(epochs)):
+        for epoch in range(epochs):
             log.debug(f'Running on epoch : {epoch}')
-            for batch in dataloader:
+            for batch in tqdm(dataloader, total=len(dataset) // batch_size, desc=f'Epoch {epoch}'):
                 # Move batch to device
                 for key in ['query', 'sample0', 'sample1', 'sample2', 'sample3']:
                     if key in batch:

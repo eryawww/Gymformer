@@ -1,16 +1,26 @@
 reward:
   model: openai-community/gpt2
   datasets_path:
+    # - data/cnndm_offline_60k
+    # - data/cnndm_online_45k
     - data/descriptiveness_offline_5k
+    # - data/sentimen_offline_5k
+    # - data/tldr_offline_60k
+    # - data/tldr_online_45k
   batch_size: 32
-  epochs: 3
+  epochs: 5
 
 lm:
   model: openai-community/gpt2
   datasets_path:
+    # - data/cnndm_offline_60k
+    # - data/cnndm_online_45k
     - data/descriptiveness_offline_5k
-  batch_size: 2
-  epochs: 5
+    # - data/sentimen_offline_5k
+    # - data/tldr_offline_60k
+    # - data/tldr_online_45k
+  batch_size: 8
+  epochs: 10_000
   # TODO: Do proper configuration
   ppo:
     learning_rate: 1.4e-5
