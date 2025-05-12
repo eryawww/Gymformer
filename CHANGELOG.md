@@ -1,5 +1,27 @@
 # Changelog
 
+## [v1.0.0] - 2023-05-13
+### Major Framework Transformation: LM Human Preferences → Gymformer
+- Complete rebranding from "LM Human Preferences" to "Gymformer" to better reflect the framework's capabilities
+- Fully embraced Gymnasium as the unified interface for all environments
+- Created modular architecture with extendable components:
+  - `env`: Added CoTEnv for Chain-of-Thought math reasoning alongside RLHF
+  - `lm`: Reorganized reward model implementations for better interoperability
+  - `rl`: Enhanced PPO implementation with direct transformer model support
+
+### New Features
+- Custom language model environments now fully compatible with Gymnasium API
+- Unified training interface through `train_agent()` for all environment types
+- Support for both language tasks (RLHF, CoT) and classic RL problems with the same API
+- Simplified extension points for creating custom environments and models
+- Enhanced documentation with code examples for multiple use cases
+
+### Technical Changes
+- Completely refactored directory structure for better modularity
+- Improved environment registration system for custom environments
+- Better reward model implementation with clearer integration points
+- Standardized observation and action space handling for language models
+
 ## [v0.last] - 2025-04-23
 ### Legacy architecture final state
 - This commit marks the last state of the original architecture before a major migration.
@@ -13,8 +35,5 @@
 - Configuration is managed through YAML files for both reward model and language model training.
 - The codebase is organized for extensibility and maintainability, following clear inheritance and modular design patterns.
 
-## [Upcoming]
-### Migration to stable-baselines3, gymnasium, and transformer-interaction
-- The upcoming architecture will replace the previous RL training approach, which used a custom reward model with the `trl` library, with a new stack based on `stable-baselines3`, `gymnasium`, and the `transformer-interaction` library.
-- This change is intended to provide full flexibility, extensibility, and compatibility with modern RL and simulation environments.
-- Users and contributors should refer to the `v0.last` tag for the last stable version of the legacy system based on `trl`.
+## Planned Upcoming Milestone
+### 1.X Performance focus implementation
