@@ -13,8 +13,11 @@
 - Configuration is managed through YAML files for both reward model and language model training.
 - The codebase is organized for extensibility and maintainability, following clear inheritance and modular design patterns.
 
-## [Upcoming]
-### Migration to stable-baselines3, gymnasium, and transformer-interaction
+## [Upcoming1]
+### Migration to stable-baselines3, gymnasium, and transformer-interaction with focus on implementation correctness
 - The upcoming architecture will replace the previous RL training approach, which used a custom reward model with the `trl` library, with a new stack based on `stable-baselines3`, `gymnasium`, and the `transformer-interaction` library.
 - This change is intended to provide full flexibility, extensibility, and compatibility with modern RL and simulation environments.
 - Users and contributors should refer to the `v0.last` tag for the last stable version of the legacy system based on `trl`.
+
+## [Upcoming2]
+### Performance focus implementation

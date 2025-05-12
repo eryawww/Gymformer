@@ -1,0 +1,234 @@
+import logging
+from dataclasses import dataclass, asdict
+from typing import override
+
+import torch
+from torch import nn
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+from transformers.modeling_outputs import ModelOutput
+from datasets import Dataset, concatenate_datasets
+from typing import Optional
+import pandas as pd
+import swifter
+from tqdm import tqdm
+import wandb
+import numpy as np
+import os
+
+from lm_human_preferences.utils import set_seed, get_device
+
+log = logging.getLogger(__name__)
+
+@dataclass
+class RewardOutput(ModelOutput):
+    loss: torch.FloatTensor
+    scores: torch.FloatTensor = None
+
+class RewardModel(nn.Module):
+    """
+        Model wrapper for training with K preference comparison examples
+
+        We assume fix K for each RewardModel
+
+        RewardModel.model: sequence -> real number directly
+        Above is the one saved and actually used further
+
+        Args:
+            base_model: str, name of the base model to use
+            seed: int, seed for reproducibility
+            device: str, device to use
+
+    """
+    def __init__(self, base_model: str, trained_tokenizer: Optional[AutoTokenizer] = None, trained_model: Optional[AutoModelForSequenceClassification] = None, seed: int = 42, device: str = 'cuda'):
+        log.info('Instantiating RewardModel')
+        super().__init__()
+        self.base_model = base_model
+        self.seed = seed
+        
+        # Set seed for reproducibility
+        set_seed(self.seed)
+        
+        # Set device
+        self.device = get_device(device)
+        log.info(f'Using device: {self.device}')
+        
+        self.tokenizer = (
+            trained_tokenizer if trained_tokenizer else 
+            AutoTokenizer.from_pretrained(base_model)
+        )
+        self.model = (
+            trained_model if trained_model else 
+            AutoModelForSequenceClassification.from_pretrained(
+                base_model,
+                num_labels=1,
+                problem_type='regression'
+            )
+        )
+        # freeze the entire transformer
+        for param in self.model.transformer.parameters():
+            param.requires_grad = False
+        # make sure head is trainable
+        for param in self.model.score.parameters():
+            param.requires_grad = True
+        
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.model.config.pad_token_id = self.tokenizer.eos_token_id
+
+        # Move model components to the specified device
+        self.model.to(self.device)
+    
+    def forward(
+        self, 
+        query: dict[str, torch.Tensor], 
+        samples: tuple[dict[str, torch.Tensor]], 
+        best: torch.Tensor
+    ) -> RewardOutput:
+        """
+            This function computes the loss for one batch of data.
+            
+            Map x, y1, y2, y3, y4, best -> loss (real number)
+            
+            Algorithm:
+                For each yi, compute real value logits r(x, yi) 
+                loss = log frac{ exp(r(x, y_best)) }{ sum_i exp(r(x, y_i)) }
+        
+            Args:
+                query: dict[str, torch.Tensor] with keys 'input_ids' and 'attention_mask', shape (batch_size, seq_len)
+                samples: tuple[dict[str, torch.Tensor]] each with keys 'input_ids' and 'attention_mask', shape (batch_size, seq_len)
+                best: int, shape (batch_size)
+            Returns:
+                loss: torch.tensor, shape (1)
+        """
+        assert query["input_ids"].size(0) == best.size(0), 'Batch size must be same for all inputs'
+        batch_size = query["input_ids"].size(0)
+        sample_size = len(samples)
+
+        # 1. Combine query and samples, flatten to generate (batch_size * sample_size, seq_len) so we could forward in paralel
+        combined_query_samples_list, combined_attention_samples_list = [], []
+        for i_batch in range(batch_size):
+            for sample in samples:
+                combined = self._combine_query_sample(query["input_ids"][i_batch], sample["input_ids"][i_batch])
+                combined_query_samples_list.append(combined)
+                
+                combined_attention = (combined != self.tokenizer.pad_token_id).long()
+                combined_attention_samples_list.append(combined_attention)
+
+        try:
+            flat_ids = torch.stack(combined_query_samples_list, dim=0)
+            flat_att = torch.stack(combined_attention_samples_list, dim=0)
+        except RuntimeError:
+            # sequences have varying lengths; pad them
+            flat_ids = pad_sequence(combined_query_samples_list, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+            flat_att = pad_sequence(combined_attention_samples_list, batch_first=True, padding_value=0)
+        flat_ids = flat_ids.to(self.device) # (batch_size * sample_size, seq_len)
+        flat_att = flat_att.to(self.device) # (batch_size * sample_size, seq_len)
+
+        # Forward to model
+        scores = self.model(
+            input_ids=flat_ids, 
+            attention_mask=flat_att
+        ).logits # (batch_size * sample_size, 1)
+
+        scores = scores.view(batch_size, sample_size) # (batch_size, sample_size)
+        
+        selected = torch.gather(scores, 1, best.unsqueeze(1)) # (batch_size, 1)
+        logsum = torch.logsumexp(scores, dim=1, keepdim=True) # (batch_size, 1)
+        loss = -(selected - logsum).mean()
+        
+        return RewardOutput(loss=loss, scores=scores)
+    
+    @override
+    def __getattr__(self, name: str): # We extend the attribute lookup to model for optimized implementation
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.model, name)
+    
+    def _combine_query_sample(self, query: torch.Tensor, sample: torch.Tensor) -> torch.Tensor:
+        """
+            Args:
+                query: torch.tensor, shape (batch_size, seq_len)
+                sample: torch.tensor, shape (batch_size, seq_len)
+            Returns:
+                combined: torch.tensor, shape (batch_size, seq_len)
+
+            Combine query and samples prompt, remove pad inbetween
+            Query format is [Q1, Q2, ..., PAD, PAD]
+            Sample format is [S1, S2, ..., PAD, PAD]
+            Output format is [Q1, Q2, ..., S1, S2, PAD, PAD]
+        """
+        assert query.dim() == 1 and sample.dim() == 1, 'Query and Sample must be 1D tensor'
+        # BUG: On some datasets, there exists case where continuation is on subword level 
+        #   Query: "... work" Sample: "ing ...", "working" should be single token instead of two tokens concatenated
+        # in this case, decode into string and then re-encode is the general solution
+        
+        # Find the first padding token in query and sample
+        concatenated_result = torch.full((len(query) + len(sample),), self.tokenizer.pad_token_id)
+        q_valid = query[query != self.tokenizer.pad_token_id]
+        s_valid = sample[sample != self.tokenizer.pad_token_id]
+        
+        # Concatenate valid tokens
+        concatenated_result[:len(q_valid)] = q_valid
+        concatenated_result[len(q_valid):len(q_valid) + len(s_valid)] = s_valid
+        return concatenated_result
+        
+    def save(self, save_path: str):
+        """
+        Save the reward model, tokenizer, and configuration to the specified path
+        
+        Args:
+            save_path: str, path to save the model
+        """
+        log.info(f"Saving reward model to {save_path}")
+        
+        # Create directory if it doesn't exist
+        os.makedirs(save_path, exist_ok=True)
+        
+        # Save the model and tokenizer
+        self.model.save_pretrained(save_path)
+        self.tokenizer.save_pretrained(save_path)
+        
+        # Save additional metadata
+        torch.save({
+            'base_model': self.base_model,
+            'seed': self.seed,
+            'device': self.device
+        }, os.path.join(save_path, "reward_model_metadata.pt"))
+        
+        log.info(f"Reward model saved successfully to {save_path}")
+    
+    @classmethod
+    def from_pretrained(cls, load_path: str, device: str = 'cuda'):
+        """
+        Load a reward model from the specified path
+        
+        Args:
+            load_path: str, path to load the model from
+            device: str, device to load the model on
+        
+        Returns:
+            RewardModel: loaded reward model
+        """
+        log.info(f"Loading reward model from {load_path}")
+        
+        # Load metadata
+        metadata = torch.load(os.path.join(load_path, "reward_model_metadata.pt"))
+        
+        # Create model instance
+        backbone_model = AutoModelForSequenceClassification.from_pretrained(load_path)
+        tokenizer = AutoTokenizer.from_pretrained(load_path)
+        
+        model = cls(
+            trained_tokenizer=tokenizer, 
+            trained_model=backbone_model, 
+            base_model=metadata['base_model'],
+            seed=metadata['seed'],
+            device=device
+        )
+        
+        model.model.to(device)
+        
+        log.info(f"Reward model loaded successfully from {load_path}")
+        return model
