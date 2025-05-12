@@ -2,15 +2,17 @@ from dataclasses import dataclass
 from typing import Union, Optional, Any, Dict, Tuple, List
 import gymnasium as gym
 from gymnasium import spaces
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
 from transformers.modeling_outputs import ModelOutput
 import torch
 from torch import tensor, Tensor
 import torch.nn.functional as F
-from lm_human_preferences.data.base import QueryData
+from gymformer.data.base import QueryData
+from gymformer.utils import DeviceManager
 import numpy as np
 import random
 from gymnasium.vector import VectorEnv
+from gymformer.lm.reward import RewardModelWrapper
 
 StateTypes = Union[List[int], str]  # Tokenized sequence or string prompt
 
@@ -41,16 +43,6 @@ class RLHFEnv(gym.Env):
     Assumption:
         reward_model and ref_model_name does not share the same backbone architecture
     
-    Attributes:
-        tokenizer: Tokenizer for the language model
-        reference_model: Base language model to compare against for KL penalty
-        reward_model: Model that provides reward signals based on human preferences
-        vocab_size: Size of the vocabulary of the language model
-        dataset: Optional dataset for sampling initial states
-        max_generation: Maximum number of tokens to generate
-        kl_coef: Coefficient for KL divergence penalty
-        device: Device to run models on ('cuda' or 'cpu')
-        seed: Random seed for reproducibility
     """
     metadata = {
         "render_modes": ["human"]
@@ -59,11 +51,11 @@ class RLHFEnv(gym.Env):
     def __init__(
         self, 
         ref_model_name: str, 
-        reward_model: torch.nn.Module, 
+        reward_model: AutoModelForSequenceClassification, 
         dataset: Optional[QueryData] = None, 
         kl_coef: float = 0.01, 
         max_generation: int = 64, 
-        device: str = 'cuda', 
+        device: Optional[str] = None,
         seed: int = 42
     ):
         """Initialize the RLHF Environment.
@@ -74,7 +66,7 @@ class RLHFEnv(gym.Env):
             dataset: Optional dataset for sampling initial states
             kl_coef: Coefficient for KL divergence penalty
             max_generation: Maximum number of tokens to generate
-            device: Device to run models on ('cuda' or 'cpu')
+            device: Device string (e.g., 'cuda', 'cpu') or None to use DeviceManager's default.
             seed: Random seed for reproducibility
         """
         super(RLHFEnv, self).__init__()
@@ -82,13 +74,23 @@ class RLHFEnv(gym.Env):
         # Set seed for reproducibility
         self.seed_value = seed
         
+        # Initialize DeviceManager and set/get device
+        self.device_manager = DeviceManager()
+        if device is not None:
+            self.device = self.device_manager.set_device(device)
+        else:
+            self.device = self.device_manager.get_device()
+            
         # Initialize models
         self.tokenizer = AutoTokenizer.from_pretrained(ref_model_name)
         if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             
-        self.reference_model = AutoModelForCausalLM.from_pretrained(ref_model_name).to(device).requires_grad_(False)
-        self.reward_model = reward_model.to(device).requires_grad_(False)
+        self.reference_model = AutoModelForCausalLM.from_pretrained(ref_model_name).to(self.device).requires_grad_(False)
+        self.reward_model = reward_model.to(self.device).requires_grad_(False)
+
+        # Ensure reward model is in eval mode
+        self.reward_model.eval()
 
         self.vocab_size = self.reference_model.config.vocab_size
         
@@ -115,7 +117,6 @@ class RLHFEnv(gym.Env):
             self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 
             self.tokenizer.eos_token_id
         )
-        self.device = device
 
         # State variables
         self.state = []
@@ -231,9 +232,12 @@ class RLHFEnv(gym.Env):
         Returns:
             Float reward value
         """
-        # last_hidden_states [1, seq_len, hidden_size]
-        seq_reward = self.reward_model.model(state).logits  # [1, seq_len, 1]
-        return seq_reward.item()
+        with torch.no_grad():
+            # Get reward model output
+            outputs = self.reward_model(state)
+            # Extract the reward value (regression output)
+            reward = outputs.logits.squeeze(-1).item()
+            return reward
     
     def _get_kl_penalty(self, state: Tensor, action: int, policy_logprobs: Tensor) -> float:
         """Calculate the KL divergence penalty.
@@ -305,7 +309,7 @@ class RLHFEnv(gym.Env):
         num_envs: int = 4,
         kl_coef: float = 0.01,
         max_generation: int = 64,
-        device: str = 'cuda',
+        device: Optional[str] = 'cuda',
         start_seed: int = 42
     ) -> VectorEnv:
         """Create a vectorized environment with multiple RLHF environments.
@@ -317,7 +321,7 @@ class RLHFEnv(gym.Env):
             num_envs: Number of environments to create
             kl_coef: Coefficient for KL divergence penalty
             max_generation: Maximum number of tokens to generate
-            device: Device to run models on
+            device: Device to run models on (e.g. 'cuda', 'cpu'). Will be passed to RLHFEnv.
             start_seed: Starting seed for the environments
             
         Returns:
@@ -345,14 +349,15 @@ class RLHFEnv(gym.Env):
 if __name__ == '__main__':
     # Example usage
     from transformers import AutoModelForCausalLM
-    from lm_human_preferences.lm.reward import RewardModel
+    from gymformer.lm.reward import RewardModelWrapper
     
     MODEL_NAME = 'openai-community/gpt2'
-    reward_model = RewardModel.from_pretrained('models/reward_model').to('cuda')
-    
+    # Load reward model directly as AutoModelForSequenceClassification
+    reward_model = RewardModelWrapper.from_pretrained('models/reward_model')
+
     env = RLHFEnv(
         MODEL_NAME, 
-        reward_model,
+        reward_model,  # Now passing AutoModelForSequenceClassification directly
         dataset=QueryData.from_openai_format(
             AutoTokenizer.from_pretrained(MODEL_NAME),
             'data/descriptiveness_offline_5k'

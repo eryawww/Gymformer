@@ -1,6 +1,6 @@
 [project]
-name = "finetuning-lm-from-human-preferences"
-version = "0.1.0"
+name = "gymformer"
+version = "1.0.0"
 description = ""
 authors = [
     {name = "eryawww",email = "zazaneryawan@gmail.com"}
@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [tool.poetry]
-packages = [{include = "lm_human_preferences"}]
+packages = [{include = "gymformer"}]
 
 
 [tool.poetry.group.dev.dependencies]
@@ -33,8 +33,8 @@ pytest = "^8.3.5"
 [tool.commitizen]
 name = "cz_customize"
 tag_format = "$version"
-version_scheme = "pep440"
-version_provider = "poetry"
+version_scheme = "semver"
+version = "1.0.0"
 update_changelog_on_bump = true
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
