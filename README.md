@@ -299,3 +299,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Hugging Face for their Transformers library
 - OpenAI for their work on GPT models and RLHF
 - The Gymnasium team for their RL environment interface
+- [nikhilbarhate99/PPO-PyTorch](https://github.com/nikhilbarhate99/PPO-PyTorch) for the amazing pytoch PPO implementation
